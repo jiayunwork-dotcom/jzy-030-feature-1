@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: board
+      POSTGRES_PASSWORD: board
+      POSTGRES_DB: board
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U board -d board']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - '5432:5432'
+
+  server:
+    build: ./server
+    environment:
+      PORT: '8080'
+      DATABASE_URL: postgres://board:board@db:5432/board
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '8080:8080'
+
+  web:
+    build: ./web
+    depends_on:
+      - server
+    ports:
+      - '80:80'
+
+volumes:
+  db-data:
