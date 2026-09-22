@@ -9,6 +9,7 @@
 
 import { CollabClient } from './client';
 import type {
+  CheckpointInfo,
   Connector,
   Effects,
   Member,
@@ -63,6 +64,10 @@ export class WhiteboardStore {
   presence = new Map<string, PresenceState>();
   /** 其他用户拖动中的临时位置（userId -> 图元快照），不进入权威状态 */
   previews = new Map<string, Shape[]>();
+  /** 历史存档点（不可变，只增） */
+  checkpoints: CheckpointInfo[] = [];
+  /** 当前时间线纪元，随服务端恢复广播整体对齐 */
+  epoch = 0;
   self: Member | null = null;
   connected = false;
   tool: Tool = 'select';
@@ -122,15 +127,12 @@ export class WhiteboardStore {
     switch (msg.type) {
       case 'welcome': {
         this.self = msg.you;
-        this.shapes.clear();
-        this.connectors.clear();
-        this.members.clear();
-        for (const s of msg.snapshot.shapes) this.shapes.set(s.id, s);
-        for (const c of msg.snapshot.connectors) this.connectors.set(c.id, c);
-        for (const m of msg.snapshot.members) this.members.set(m.userId, m);
+        this.replaceAll(msg.snapshot);
         this.presence.clear();
         for (const p of msg.presence) this.presence.set(p.userId, p);
         this.previews.clear();
+        // 重连期间可能正拖着动作：快照是权威，本地半截拖动直接作废（不回写，快照整体替换）
+        this.discardDrag();
         this.emit();
         break;
       }
@@ -140,6 +142,7 @@ export class WhiteboardStore {
         if (msg.forward.patchShapes?.length || msg.forward.upsertShapes?.length) {
           this.previews.delete(msg.userId);
         }
+        // 恢复类广播不会走这里（restore 单独处理）
         this.emit();
         break;
       }
@@ -149,6 +152,26 @@ export class WhiteboardStore {
         for (const c of msg.connectors ?? []) this.connectors.set(c.id, c);
         if (this.drag && !this.canEdit) this.rollbackDrag();
         this.toast(`操作被拒绝：${msg.reason}`);
+        this.emit();
+        break;
+      }
+      case 'checkpoint.created': {
+        // 列表只增：重复 id（极端重发）不重复添加
+        if (!this.checkpoints.some((c) => c.id === msg.checkpoint.id)) {
+          this.checkpoints = [...this.checkpoints, msg.checkpoint].sort((a, b) => a.at - b.at || a.seq - b.seq);
+          this.emit();
+        }
+        break;
+      }
+      case 'restore': {
+        // 整画布恢复：不本地拼差异，直接用服务端快照整体对齐
+        // （图元位置、连线走向、成员角色一次刷新；进行中的交互打断回弹）
+        this.discardDrag();
+        this.previews.clear();
+        this.replaceAll(msg.snapshot);
+        this.selection = this.selection.filter((id) => this.shapes.has(id));
+        this.connectSource = null;
+        this.toast(`画布已由${msg.userId === this.self?.userId ? '你' : '房主'}恢复到存档点「${msg.checkpointName}」`);
         this.emit();
         break;
       }
@@ -214,6 +237,49 @@ export class WhiteboardStore {
     }
     for (const c of fx.upsertConnectors ?? []) this.connectors.set(c.id, c);
     for (const id of fx.deleteConnectorIds ?? []) this.connectors.delete(id);
+    for (const m of fx.upsertMembers ?? []) {
+      const isSelf = m.userId === this.self?.userId;
+      this.members.set(m.userId, m);
+      if (isSelf) this.self = m;
+    }
+    for (const id of fx.deleteMemberIds ?? []) this.members.delete(id);
+  }
+
+  /** 用服务端完整快照整体替换本地权威镜像（welcome/restore 共用） */
+  private replaceAll(snapshot: { shapes: Shape[]; connectors: Connector[]; members: Member[]; checkpoints: CheckpointInfo[]; epoch: number }) {
+    this.shapes.clear();
+    this.connectors.clear();
+    this.members.clear();
+    for (const s of snapshot.shapes) this.shapes.set(s.id, s);
+    for (const c of snapshot.connectors) this.connectors.set(c.id, c);
+    for (const m of snapshot.members) this.members.set(m.userId, m);
+    this.checkpoints = [...snapshot.checkpoints].sort((a, b) => a.at - b.at || a.seq - b.seq);
+    this.epoch = snapshot.epoch;
+    if (this.self) {
+      const me = this.members.get(this.self.userId);
+      if (me) this.self = me;
+    }
+  }
+
+  /** 打断进行中的拖动/连线交互：丢弃本地临时态（权威回弹由随后的消息负责） */
+  private cancelDrag() {
+    if (!this.drag) return;
+    const d = this.drag;
+    this.drag = null;
+    const shape = this.shapes.get(d.shapeId);
+    if (shape) Object.assign(shape, { x: d.origin.x, y: d.origin.y, w: d.origin.w, h: d.origin.h });
+    this.client.send({ type: 'preview.end' });
+  }
+
+  /**
+   * 丢弃进行中的拖动但不回写坐标——紧接着会有服务端完整快照整体替换本地
+   * （welcome/restore），回写过期原点反而会盖掉权威值。
+   */
+  private discardDrag() {
+    if (this.drag) {
+      this.drag = null;
+      this.client.send({ type: 'preview.end' });
+    }
   }
 
   /* ---------------- 操作发送（乐观应用 + 拒绝回滚） ---------------- */
@@ -244,6 +310,25 @@ export class WhiteboardStore {
 
   setRole(userId: string, role: Role) {
     this.client.send({ type: 'role.set', userId, role });
+  }
+
+  /* ---------------- 历史存档点 ---------------- */
+
+  get isOwner(): boolean {
+    return this.self?.role === 'owner';
+  }
+
+  /** 房主打点；非房主在 UI 上入口禁用，绕过 UI 发起时服务端也会拒绝 */
+  createCheckpoint(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return this.toast('存档点名字不能为空');
+    if (!this.isOwner) return this.toast('仅房主可以创建存档点');
+    this.client.send({ type: 'checkpoint.create', clientOpId: this.nextOpId(), name: trimmed });
+  }
+
+  restoreCheckpoint(checkpointId: string) {
+    if (!this.isOwner) return this.toast('仅房主可以恢复画布到存档点');
+    this.client.send({ type: 'checkpoint.restore', clientOpId: this.nextOpId(), checkpointId });
   }
 
   rename(name: string) {

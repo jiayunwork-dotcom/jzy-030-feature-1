@@ -1,9 +1,9 @@
 /**
  * 快照与增量：
- * - snapshot() 输出当前完整画布状态（图元/连线/成员 + 当前 seq）。
+ * - snapshot() 输出当前完整画布状态（图元/连线/成员 + 当前 seq/epoch + 存档点列表）。
  * - deltasSince(seq) 输出断线期间错过的增量（按 seq 升序），
  *   重连客户端先拿快照对齐权威状态，再凭增量确认连续性，
- *   不依赖本地缓存拼凑画面。
+ *   不依赖本地缓存拼凑。
  */
 
 import type { Engine } from './engine.js';
@@ -14,9 +14,11 @@ export function buildSnapshot(engine: Engine): Snapshot {
   return {
     canvasId: s.id,
     seq: s.seq,
+    epoch: engine.epoch,
     shapes: [...s.shapes.values()].sort((a, b) => a.z - b.z),
     connectors: [...s.connectors.values()],
     members: [...s.members.values()],
+    checkpoints: engine.listCheckpoints(),
   };
 }
 

@@ -10,12 +10,15 @@
  * - 图元几何变化后，受影响连线经路由模块重算，路径随操作一并广播。
  */
 
-import { OpError, assertCanEdit, assertCanManageRoles, isValidRole } from './permissions.js';
+import { OpError, assertCanEdit, assertCanManageHistory, assertCanManageRoles, isValidRole } from './permissions.js';
+import { canonicalState, diffStates } from './history.js';
 import { routeConnector } from './router.js';
 import type { Store } from './persistence/store.js';
 import {
   BOUNDS,
   type CanvasState,
+  type Checkpoint,
+  type CheckpointInfo,
   type Connector,
   type Effects,
   type LogEntry,
@@ -40,8 +43,12 @@ const PATCHABLE_KEYS = new Set(['x', 'y', 'w', 'h', 'z', 'color', 'text']);
 export class Engine {
   readonly state: CanvasState;
   readonly log: LogEntry[] = [];
+  /** 存档点（只增不改不删），按创建顺序 */
+  readonly checkpoints: Checkpoint[] = [];
+  /** 当前时间线纪元：每恢复一次 +1，0 = 从未恢复过 */
+  epoch = 0;
   private store: Store;
-  /** 串行化队列：保证 定序 = 接收顺序 = 持久化顺序 */
+  /** 串行化队列：保证 定序 = 接收顺序 = 持久化顺序（打点/恢复/普通写共用一条） */
   private queue: Promise<unknown> = Promise.resolve();
 
   private constructor(state: CanvasState, store: Store) {
@@ -64,8 +71,18 @@ export class Engine {
       for (const s of persisted.shapes) state.shapes.set(s.id, s);
       for (const c of persisted.connectors) state.connectors.set(c.id, c);
       for (const m of persisted.members) state.members.set(m.userId, m);
-      for (const e of persisted.ops) engine.log.push(e);
+      for (const e of persisted.ops) {
+        // 兼容旧数据：没有纪元字段的老日志一律视为纪元 0
+        e.epoch ??= 0;
+        engine.log.push(e);
+      }
+      // 兼容旧数据：没有纪元字段的老存档点一律视为纪元 0
+      for (const cp of persisted.checkpoints ?? []) {
+        cp.epoch ??= 0;
+        engine.checkpoints.push(cp);
+      }
       state.seq = persisted.ops.reduce((max, e) => Math.max(max, e.seq), 0);
+      engine.epoch = persisted.ops.reduce((max, e) => Math.max(max, e.epoch ?? 0), 0);
     }
     return engine;
   }
@@ -129,9 +146,11 @@ export class Engine {
   async undo(userId: string): Promise<LogEntry> {
     const member = this.state.members.get(userId);
     assertCanEdit(member, userId);
+    // 只在当前纪元内回退：恢复（跨所有人的整画布跳变）之后，
+    // 任何人都不可能用撤销跨过恢复点把画面拽回恢复前。
     const target = [...this.log]
       .reverse()
-      .find((e) => e.userId === userId && e.kind === 'normal' && !e.undone);
+      .find((e) => e.userId === userId && e.kind === 'normal' && !e.undone && e.epoch === this.epoch);
     if (!target) throw new OpError('没有可撤销的操作');
     const entry = await this.commit(userId, 'undo', target.inverse, `撤销：${target.label}`, target.seq);
     await this.markFlags(target.seq, { undone: true, undoneBy: entry.seq });
@@ -142,7 +161,7 @@ export class Engine {
     const member = this.state.members.get(userId);
     assertCanEdit(member, userId);
     const target = [...this.log]
-      .filter((e) => e.userId === userId && e.kind === 'normal' && e.undone && e.redoable)
+      .filter((e) => e.userId === userId && e.kind === 'normal' && e.undone && e.redoable && e.epoch === this.epoch)
       .sort((a, b) => (b.undoneBy ?? 0) - (a.undoneBy ?? 0))[0];
     if (!target) throw new OpError('没有可重做的操作');
     const entry = await this.commit(userId, 'redo', target.forward, `重做：${target.label}`, target.seq);
@@ -264,6 +283,7 @@ export class Engine {
     template: Effects,
     label: string,
     targetSeq?: number,
+    meta?: { checkpointId?: string; checkpointName?: string },
   ): Promise<LogEntry> {
     const forward: Effects = {};
     const inverse: Effects = {};
@@ -337,8 +357,25 @@ export class Engine {
       (forward.deleteConnectorIds ??= []).push(id);
     }
 
-    // 几何变化 -> 受影响连线重算（端点重新贴合最近锚点，路径重算）
-    if (geometryTouched.size > 0) {
+    // upsertMembers：成员整体切换（恢复时携带角色等）。逆操作为恢复旧成员。
+    for (const m of template.upsertMembers ?? []) {
+      const prev = this.state.members.get(m.userId);
+      if (prev) (inverse.upsertMembers ??= []).push(structuredClone(prev));
+      else (inverse.deleteMemberIds ??= []).push(m.userId);
+      this.state.members.set(m.userId, structuredClone(m));
+      (forward.upsertMembers ??= []).push(structuredClone(m));
+    }
+    for (const id of template.deleteMemberIds ?? []) {
+      const prev = this.state.members.get(id);
+      if (!prev) continue;
+      (inverse.upsertMembers ??= []).push(structuredClone(prev));
+      this.state.members.delete(id);
+      (forward.deleteMemberIds ??= []).push(id);
+    }
+
+    // 几何变化 -> 受影响连线重算（端点重新贴合最近锚点，路径重算）。
+    // restore 直接采用存档记录的连线，不做重算（存档内容即权威）。
+    if (kind !== 'restore' && geometryTouched.size > 0) {
       for (const conn of this.state.connectors.values()) {
         if (!geometryTouched.has(conn.from) && !geometryTouched.has(conn.to)) continue;
         const from = this.state.shapes.get(conn.from);
@@ -367,8 +404,11 @@ export class Engine {
       targetSeq,
       undone: false,
       redoable: true,
+      epoch: this.epoch,
       at: Date.now(),
       label,
+      checkpointId: meta?.checkpointId,
+      checkpointName: meta?.checkpointName,
     };
     this.state.seq = entry.seq;
     this.log.push(entry);
@@ -383,13 +423,19 @@ export class Engine {
       }
     }
 
-    await this.persist(entry, forward);
+    await this.persist(entry, kind === 'restore');
     return entry;
   }
 
-  private async persist(entry: LogEntry, forward: Effects): Promise<void> {
+  private async persist(entry: LogEntry, wholeStateInOp: boolean): Promise<void> {
     const canvasId = this.state.id;
+    // restore 条目：实体切换已随 appendOp 在同一事务落库，不再逐条写
+    if (wholeStateInOp) {
+      await this.store.appendOp(canvasId, entry);
+      return;
+    }
     await this.store.appendOp(canvasId, entry);
+    const forward = entry.forward;
     for (const s of forward.upsertShapes ?? []) await this.store.upsertShape(canvasId, s);
     for (const p of forward.patchShapes ?? []) {
       const s = this.state.shapes.get(p.id);
@@ -422,6 +468,80 @@ export class Engine {
       case 'connector.delete':
         return `删除连线 ${op.connectorId.slice(0, 6)}`;
     }
+  }
+
+  /* ---------------- 历史存档点 / 整画布恢复 ---------------- */
+
+  listCheckpoints(): CheckpointInfo[] {
+    return this.checkpoints.map((cp) => ({
+      id: cp.id,
+      name: cp.name,
+      createdBy: cp.createdBy,
+      creatorName: cp.creatorName,
+      at: cp.at,
+      seq: cp.seq,
+      epoch: cp.epoch,
+    }));
+  }
+
+  /** 房主打点：固化此刻完整权威状态；打点本身不占 seq、不改纪元 */
+  async createCheckpoint(requesterId: string, rawName: string): Promise<Checkpoint> {
+    const member = this.state.members.get(requesterId);
+    assertCanManageHistory(member, requesterId, '创建存档点');
+    const name = (rawName ?? '').trim();
+    if (!name) throw new OpError('存档点名字不能为空');
+    if (name.length > BOUNDS.maxCheckpointName)
+      throw new OpError(`存档点名字过长（上限 ${BOUNDS.maxCheckpointName} 字）`);
+    const cp: Checkpoint = {
+      id: crypto.randomUUID(),
+      canvasId: this.state.id,
+      name,
+      createdBy: requesterId,
+      creatorName: member.name,
+      at: Date.now(),
+      seq: this.state.seq,
+      epoch: this.epoch,
+      state: canonicalState(this.state.shapes.values(), this.state.connectors.values(), this.state.members.values()),
+    };
+    this.checkpoints.push(cp);
+    await this.store.saveCheckpoint(this.state.id, cp);
+    return cp;
+  }
+
+  /**
+   * 房主恢复：把权威状态整体切换成存档点内容。
+   * - 与普通编辑共用同一条串行队列，恢复进行期间不会有别的写插入。
+   * - 恢复本身占一个新 seq（kind='restore'），所有客户端凭 seq 确认。
+   * - 纪元 +1：恢复后撤销/重做只作用于新纪元内本人的操作；
+   *   中间那段操作日志一条不删，仍可再打新点、倒回任意更早/更晚的存档点。
+   * - 存档内容自带完整连线（端点均为当时存在的图元），不会产生悬空连线。
+   */
+  async restoreCheckpoint(requesterId: string, checkpointId: string): Promise<{ entry: LogEntry; checkpoint: Checkpoint }> {
+    const member = this.state.members.get(requesterId);
+    assertCanManageHistory(member, requesterId, '恢复画布');
+    if (typeof checkpointId !== 'string' || !checkpointId) throw new OpError('存档点 id 非法');
+    const checkpoint = this.checkpoints.find((cp) => cp.id === checkpointId);
+    if (!checkpoint) throw new OpError(`存档点 ${checkpointId} 不存在`);
+
+    const before = canonicalState(this.state.shapes.values(), this.state.connectors.values(), this.state.members.values());
+    const target = canonicalState(checkpoint.state.shapes, checkpoint.state.connectors, checkpoint.state.members);
+    // 防御：若存档内容中出现悬空连线（理论上不可能），丢弃之，绝不把脏引用落库
+    const targetShapeIds = new Set(target.shapes.map((s) => s.id));
+    target.connectors = target.connectors.filter((c) => targetShapeIds.has(c.from) && targetShapeIds.has(c.to));
+
+    const forward = diffStates(before, target);
+
+    this.epoch += 1;
+    // 不在此预应用状态：commit 在切换前状态上应用 forward 并派生对称 inverse
+    const entry = await this.commit(
+      requesterId,
+      'restore',
+      forward,
+      `恢复到存档点「${checkpoint.name}」`,
+      undefined,
+      { checkpointId: checkpoint.id, checkpointName: checkpoint.name },
+    );
+    return { entry, checkpoint };
   }
 
   /* ---------------- 快照与增量 ---------------- */

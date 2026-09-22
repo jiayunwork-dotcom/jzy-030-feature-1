@@ -45,6 +45,16 @@ export interface Member {
   color: string;
 }
 
+export interface CheckpointInfo {
+  id: string;
+  name: string;
+  createdBy: string;
+  creatorName: string;
+  at: number;
+  seq: number;
+  epoch: number;
+}
+
 export type Op =
   | { kind: 'shape.create'; shape: { id: string; kind: ShapeKind; x: number; y: number; w: number; h: number; color?: string; text?: string; z?: number } }
   | { kind: 'shape.set'; shapeId: string; attrs: ShapeAttrs }
@@ -63,14 +73,18 @@ export interface Effects {
   deleteShapeIds?: string[];
   upsertConnectors?: Connector[];
   deleteConnectorIds?: string[];
+  upsertMembers?: Member[];
+  deleteMemberIds?: string[];
 }
 
 export interface Snapshot {
   canvasId: string;
   seq: number;
+  epoch: number;
   shapes: Shape[];
   connectors: Connector[];
   members: Member[];
+  checkpoints: CheckpointInfo[];
 }
 
 export interface PresenceState {
@@ -84,6 +98,8 @@ export type ClientMessage =
   | { type: 'op'; clientOpId: string; op: Op }
   | { type: 'undo'; clientOpId: string }
   | { type: 'redo'; clientOpId: string }
+  | { type: 'checkpoint.create'; clientOpId: string; name: string }
+  | { type: 'checkpoint.restore'; clientOpId: string; checkpointId: string }
   | { type: 'preview'; shapes: Shape[] }
   | { type: 'preview.end' }
   | { type: 'presence'; cursor: { x: number; y: number } | null; selection: string[] }
@@ -94,6 +110,8 @@ export type ServerMessage =
   | { type: 'op'; seq: number; userId: string; kind: string; forward: Effects; label: string }
   | { type: 'op.ack'; clientOpId: string; seq: number }
   | { type: 'op.reject'; clientOpId: string; reason: string; shapes?: Shape[]; connectors?: Connector[] }
+  | { type: 'checkpoint.created'; checkpoint: CheckpointInfo }
+  | { type: 'restore'; seq: number; epoch: number; userId: string; checkpointId: string; checkpointName: string; snapshot: Snapshot }
   | { type: 'preview'; userId: string; shapes: Shape[] }
   | { type: 'preview.clear'; userId: string; shapes: Shape[] }
   | { type: 'presence'; presence: PresenceState }

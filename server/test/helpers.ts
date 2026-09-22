@@ -8,9 +8,11 @@ import WebSocket from 'ws';
 import { createServer } from '../src/index.js';
 import { MemoryStore, type Store } from '../src/persistence/store.js';
 import type {
+  CheckpointInfo,
   ClientMessage,
   Connector,
   Effects,
+  Member,
   Op,
   ServerMessage,
   Shape,
@@ -45,6 +47,9 @@ export class TestClient {
   messages: ServerMessage[] = [];
   shapes = new Map<string, Shape>();
   connectors = new Map<string, Connector>();
+  members = new Map<string, Member>();
+  checkpoints: CheckpointInfo[] = [];
+  epoch = 0;
   lastSeq = 0;
   private waiters: { pred: (m: ServerMessage) => boolean; resolve: (m: ServerMessage) => void }[] = [];
 
@@ -82,6 +87,13 @@ export class TestClient {
       this.applyEffects(msg.forward);
       this.lastSeq = Math.max(this.lastSeq, msg.seq);
     }
+    if (msg.type === 'restore') {
+      this.applySnapshot(msg.snapshot);
+      this.lastSeq = Math.max(this.lastSeq, msg.seq);
+    }
+    if (msg.type === 'checkpoint.created' && !this.checkpoints.some((c) => c.id === msg.checkpoint.id)) {
+      this.checkpoints.push(msg.checkpoint);
+    }
     for (let i = this.waiters.length - 1; i >= 0; i--) {
       if (this.waiters[i].pred(msg)) {
         const w = this.waiters[i];
@@ -94,8 +106,12 @@ export class TestClient {
   private applySnapshot(snap: Snapshot) {
     this.shapes.clear();
     this.connectors.clear();
+    this.members.clear();
     for (const s of snap.shapes) this.shapes.set(s.id, s);
     for (const c of snap.connectors) this.connectors.set(c.id, c);
+    for (const m of snap.members) this.members.set(m.userId, m);
+    this.checkpoints = [...snap.checkpoints];
+    this.epoch = snap.epoch;
   }
 
   applyEffects(fx: Effects) {
@@ -145,18 +161,53 @@ export class TestClient {
     return msg.type === 'op.ack' ? { acked: true, seq: msg.seq } : { acked: false, reason: msg.reason };
   }
 
+  /** 房主打存档点，等待 ack 并取回广播里的存档点信息 */
+  async checkpoint(name: string): Promise<{ acked: boolean; seq?: number; reason?: string; checkpoint?: CheckpointInfo }> {
+    const clientOpId = `c${++opCounter}`;
+    const seenAt = this.messages.length;
+    const ack = this.waitFor(
+      (m) => (m.type === 'op.ack' || m.type === 'op.reject') && m.clientOpId === clientOpId,
+    );
+    this.send({ type: 'checkpoint.create', clientOpId, name });
+    const ackMsg = await ack;
+    if (ackMsg.type !== 'op.ack') return { acked: false, reason: ackMsg.reason };
+    // 只认发送之后到达的 checkpoint.created，避免捡到更早的缓冲消息
+    const created = (await this.waitFor((m) => m.type === 'checkpoint.created', 3000, seenAt)) as Extract<
+      ServerMessage,
+      { type: 'checkpoint.created' }
+    >;
+    return { acked: true, seq: ackMsg.seq, checkpoint: created.checkpoint };
+  }
+
+  /** 发起恢复，等待 ack/reject（restore 广播用 waitRestore 另等） */
+  async restore(checkpointId: string): Promise<{ acked: boolean; seq?: number; reason?: string }> {
+    const clientOpId = `c${++opCounter}`;
+    const result = this.waitFor(
+      (m) => (m.type === 'op.ack' || m.type === 'op.reject') && m.clientOpId === clientOpId,
+    );
+    this.send({ type: 'checkpoint.restore', clientOpId, checkpointId });
+    const msg = await result;
+    return msg.type === 'op.ack' ? { acked: true, seq: msg.seq } : { acked: false, reason: msg.reason };
+  }
+
+  waitRestore(timeoutMs = 3000) {
+    return this.waitFor((m) => m.type === 'restore', timeoutMs) as Promise<
+      Extract<ServerMessage, { type: 'restore' }>
+    >;
+  }
+
   /** 等待客户端应用过 seq >= 指定值的广播（消除"ack 已到、广播未到"的竞态） */
   waitSeq(seq: number, timeoutMs = 3000): Promise<ServerMessage> {
     return this.waitFor((m) => m.type === 'op' && m.seq >= seq, timeoutMs);
   }
 
-  waitFor(pred: (m: ServerMessage) => boolean, timeoutMs = 3000): Promise<ServerMessage> {
-    const buffered = this.messages.find(pred);
+  waitFor(pred: (m: ServerMessage) => boolean, timeoutMs = 3000, afterIndex = 0): Promise<ServerMessage> {
+    const buffered = this.messages.slice(afterIndex).find(pred);
     if (buffered) return Promise.resolve(buffered);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('waitFor 超时')), timeoutMs);
       this.waiters.push({
-        pred,
+        pred: (m) => this.messages.indexOf(m) >= afterIndex && pred(m),
         resolve: (m) => {
           clearTimeout(timer);
           resolve(m);

@@ -57,6 +57,48 @@ export interface CanvasState {
   members: Map<string, Member>;
 }
 
+/**
+ * 存档点记录的权威画布内容（所有图元、连线、成员角色）。
+ * 三个数组都按稳定键排序，序列化（canonical JSON）后逐字节确定：
+ * 同一存档点在任意时刻、任意实例上重建，结果完全一致。
+ */
+export interface CanonicalState {
+  shapes: Shape[];
+  connectors: Connector[];
+  members: Member[];
+}
+
+/**
+ * 历史存档点（不可变）。state 为打点那一刻的完整权威画布内容，
+ * 之后画布继续变化也不会影响这里记录的内容。
+ */
+export interface Checkpoint {
+  id: string;
+  canvasId: string;
+  name: string;
+  createdBy: string;
+  creatorName: string;
+  /** 打点时刻（epoch 毫秒） */
+  at: number;
+  /** 打点时操作序列位置（打点不占 seq，即当时 state.seq） */
+  seq: number;
+  /** 打点时所处的时间线纪元（每恢复一次 +1，打点不改变纪元） */
+  epoch: number;
+  /** 完整权威画布内容（已规范化排序） */
+  state: CanonicalState;
+}
+
+/** 存档点的对外摘要：不含完整内容体，只给列表展示用 */
+export interface CheckpointInfo {
+  id: string;
+  name: string;
+  createdBy: string;
+  creatorName: string;
+  at: number;
+  seq: number;
+  epoch: number;
+}
+
 /** 客户端发起的操作（属性级，绝对值语义，保证可重放收敛） */
 export type Op =
   | {
@@ -86,6 +128,7 @@ export interface ShapePatch {
 /**
  * 一次状态变更的效果集：所有广播/日志/撤销都以 effects 表达，
  * 客户端只需无脑应用 upsert/patch/delete 即可收敛。
+ * members 为整画布恢复时携带的成员（含角色）整体切换。
  */
 export interface Effects {
   upsertShapes?: Shape[];
@@ -93,25 +136,37 @@ export interface Effects {
   deleteShapeIds?: string[];
   upsertConnectors?: Connector[];
   deleteConnectorIds?: string[];
+  upsertMembers?: Member[];
+  deleteMemberIds?: string[];
 }
 
-/** 操作日志条目：forward/inverse 成对存储，撤销即应用 inverse */
+/**
+ * 操作日志条目：forward/inverse 成对存储，撤销即应用 inverse。
+ * kind='restore' 为跨所有人的整画布状态跳变，不进入任何人的按人撤销栈。
+ * epoch 标识该条目处于哪个时间线纪元：恢复只让纪元 +1，
+ * 之后用户只能撤销/重做当前纪元内自己的操作，绝不可能一撤销就跨过恢复点。
+ */
 export interface LogEntry {
   seq: number;
   userId: string;
-  kind: 'normal' | 'undo' | 'redo';
-  /** 正向效果（已含连线重算等派生变更） */
+  kind: 'normal' | 'undo' | 'redo' | 'restore';
+  /** 正向效果（已含连线重算等派生变更；restore 时为整画布差异） */
   forward: Effects;
   /** 逆向效果（撤销时应用） */
   inverse: Effects;
   /** undo/redo 指向的 normal 条目 seq */
   targetSeq?: number;
+  /** restore 条目指向的存档点 id */
+  checkpointId?: string;
+  checkpointName?: string;
   /** 仅 normal 条目有意义：是否已被撤销 */
   undone: boolean;
   /** 被哪条 undo 条目撤销 */
   undoneBy?: number;
   /** 被撤销后是否仍可重做（用户产生新 normal 操作后置 false） */
   redoable: boolean;
+  /** 时间线纪元：每发生一次恢复 +1；旧日志缺省为 0 */
+  epoch: number;
   at: number;
   /** 人类可读描述，用于调试与 UI 提示 */
   label: string;
@@ -120,9 +175,12 @@ export interface LogEntry {
 export interface Snapshot {
   canvasId: string;
   seq: number;
+  /** 当前时间线纪元（最近一次恢复后的纪元） */
+  epoch: number;
   shapes: Shape[];
   connectors: Connector[];
   members: Member[];
+  checkpoints: CheckpointInfo[];
 }
 
 export interface PresenceState {
@@ -138,6 +196,8 @@ export type ClientMessage =
   | { type: 'op'; clientOpId: string; op: Op }
   | { type: 'undo'; clientOpId: string }
   | { type: 'redo'; clientOpId: string }
+  | { type: 'checkpoint.create'; clientOpId: string; name: string }
+  | { type: 'checkpoint.restore'; clientOpId: string; checkpointId: string }
   | { type: 'preview'; shapes: Shape[] }
   | { type: 'preview.end' }
   | { type: 'presence'; cursor: { x: number; y: number } | null; selection: string[] }
@@ -166,6 +226,22 @@ export type ServerMessage =
       shapes?: Shape[];
       connectors?: Connector[];
     }
+  /** 新存档点落定：广播给房间内所有人（含创建者），列表只增不改 */
+  | { type: 'checkpoint.created'; checkpoint: CheckpointInfo }
+  /**
+   * 整画布恢复：服务端权威状态整体切换到存档点内容后，一次性广播
+   * 完整快照（图元/连线/成员）与新的 seq/epoch，所有客户端凭 seq 确认，
+   * 不允许各自本地拼凑。该消息本身占一个新的序列位置。
+   */
+  | {
+      type: 'restore';
+      seq: number;
+      epoch: number;
+      userId: string;
+      checkpointId: string;
+      checkpointName: string;
+      snapshot: Snapshot;
+    }
   | { type: 'preview'; userId: string; shapes: Shape[] }
   | { type: 'preview.clear'; userId: string; shapes: Shape[] }
   | { type: 'presence'; presence: PresenceState }
@@ -186,4 +262,5 @@ export const BOUNDS = {
   maxH: 2000,
   maxZ: 1_000_000,
   maxText: 500,
+  maxCheckpointName: 80,
 } as const;

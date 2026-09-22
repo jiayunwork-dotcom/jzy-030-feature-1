@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { CanvasView } from './components/CanvasView';
 import { MembersPanel } from './components/MembersPanel';
+import { TimelinePanel } from './components/TimelinePanel';
 import { Toolbar } from './components/Toolbar';
 import { store, useStore } from './state/hooks';
 
@@ -32,7 +33,10 @@ export default function App() {
       <Toolbar />
       <div className="main">
         <CanvasView />
-        <MembersPanel />
+        <div className="side">
+          <TimelinePanel />
+          <MembersPanel />
+        </div>
       </div>
       {store.self?.role === 'viewer' && (
         <div className="readonly-banner">你当前是只读角色：可以观看与移动光标，编辑操作将被拒绝</div>

@@ -14,6 +14,7 @@ import { OpError, canEdit } from './permissions.js';
 import type { Store } from './persistence/store.js';
 import { buildSnapshot, deltasSince } from './snapshot.js';
 import type {
+  CheckpointInfo,
   ClientMessage,
   Connector,
   Op,
@@ -111,6 +112,10 @@ export class CollabServer {
         return this.handlePresence(conn, msg);
       case 'role.set':
         return this.handleRoleSet(conn, msg.userId, msg.role);
+      case 'checkpoint.create':
+        return this.handleCheckpointCreate(conn, msg.clientOpId, msg.name);
+      case 'checkpoint.restore':
+        return this.handleCheckpointRestore(conn, msg.clientOpId, msg.checkpointId);
       default:
         this.send(conn.ws, { type: 'error', reason: `未知消息类型: ${(msg as { type: string }).type}` });
     }
@@ -277,6 +282,79 @@ export class CollabServer {
     } catch (err) {
       const reason = err instanceof OpError ? err.message : '角色调整被拒绝';
       this.send(conn.ws, { type: 'error', reason });
+    }
+  }
+
+  /* ---------------- 历史存档点 / 整画布恢复 ---------------- */
+
+  private checkpointInfo(engine: Engine, cp: { id: string; name: string; createdBy: string; creatorName: string; at: number; seq: number; epoch: number }): CheckpointInfo {
+    return {
+      id: cp.id,
+      name: cp.name,
+      createdBy: cp.createdBy,
+      creatorName: cp.creatorName,
+      at: cp.at,
+      seq: cp.seq,
+      epoch: cp.epoch,
+    };
+  }
+
+  private async handleCheckpointCreate(conn: Conn, clientOpId: string, name: string) {
+    if (!conn.userId) return this.send(conn.ws, { type: 'op.reject', clientOpId, reason: '尚未加入画布' });
+    const engine = await this.getEngine(conn.canvasId);
+    try {
+      const cp = await engine.enqueue(() => engine.createCheckpoint(conn.userId, name));
+      const info = this.checkpointInfo(engine, cp);
+      // 给创建者回 ack；列表新增广播给房间内所有人（含创建者）
+      this.send(conn.ws, { type: 'op.ack', clientOpId, seq: cp.seq });
+      this.broadcast(conn.canvasId, { type: 'checkpoint.created', checkpoint: info });
+    } catch (err) {
+      const reason = err instanceof OpError ? err.message : '创建存档点被拒绝';
+      this.send(conn.ws, { type: 'op.reject', clientOpId, reason });
+    }
+  }
+
+  private async handleCheckpointRestore(conn: Conn, clientOpId: string, checkpointId: string) {
+    if (!conn.userId) return this.send(conn.ws, { type: 'op.reject', clientOpId, reason: '尚未加入画布' });
+    const engine = await this.getEngine(conn.canvasId);
+    try {
+      const { entry } = await engine.enqueue(() => engine.restoreCheckpoint(conn.userId, checkpointId));
+      // 恢复进行中所有人手上没提交的拖动一律作废：清除全部预览并回权威态。
+      // 必须在广播 restore 之前发完，客户端先回弹再整体对齐。
+      this.interruptAllPreviews(engine);
+
+      const snapshot = buildSnapshot(engine);
+      this.send(conn.ws, { type: 'op.ack', clientOpId, seq: entry.seq });
+      // 一次性广播完整快照 + 新 seq/epoch：每个人凭 seq 确认收到这次恢复
+      this.broadcast(conn.canvasId, {
+        type: 'restore',
+        seq: entry.seq,
+        epoch: entry.epoch,
+        userId: entry.userId,
+        checkpointId: entry.checkpointId!,
+        checkpointName: entry.checkpointName ?? '',
+        snapshot,
+      });
+    } catch (err) {
+      const reason = err instanceof OpError ? err.message : '恢复画布被拒绝';
+      this.send(conn.ws, { type: 'op.reject', clientOpId, reason });
+    }
+  }
+
+  /** 打断房间内所有人进行中的拖动：清掉预览登记并广播权威回弹（每人各自的图元） */
+  private interruptAllPreviews(engine: Engine) {
+    const room = this.rooms.get(engine.state.id);
+    if (!room) return;
+    for (const [userId, ids] of [...room.previews.entries()]) {
+      if (ids.size === 0) {
+        room.previews.delete(userId);
+        continue;
+      }
+      room.previews.delete(userId);
+      const authoritative = [...ids]
+        .map((id) => engine.state.shapes.get(id))
+        .filter((s): s is Shape => Boolean(s));
+      this.broadcast(engine.state.id, { type: 'preview.clear', userId, shapes: authoritative });
     }
   }
 

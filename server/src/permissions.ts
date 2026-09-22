@@ -25,6 +25,20 @@ export function canManageRoles(role: Role): boolean {
   return role === 'owner';
 }
 
+/** 打存档点 / 发起整画布恢复：房主专属 */
+export function canManageHistory(role: Role): boolean {
+  return role === 'owner';
+}
+
+export function assertCanManageHistory(member: Member | undefined, userId: string, action: string): asserts member is Member {
+  if (!member) {
+    throw new OpError(`用户 ${userId} 不是画布成员，${action}被拒绝`);
+  }
+  if (!canManageHistory(member.role)) {
+    throw new OpError(`成员「${member.name}」不是房主，${action}仅房主可操作`);
+  }
+}
+
 /** 写操作（含 undo/redo）统一入口校验 */
 export function assertCanEdit(member: Member | undefined, userId: string): asserts member is Member {
   if (!member) {

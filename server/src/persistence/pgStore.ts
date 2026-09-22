@@ -5,7 +5,7 @@
  */
 
 import pg from 'pg';
-import type { Connector, LogEntry, Member, Shape } from '../types.js';
+import type { Checkpoint, Connector, LogEntry, Member, Shape } from '../types.js';
 import type { PersistedCanvas, Store } from './store.js';
 
 const SCHEMA = `
@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS op_log (
   at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (canvas_id, seq)
 );
+-- 历史维度（对旧库平滑升级：缺列/缺表自动补齐，老数据按默认值带起）
+ALTER TABLE op_log ADD COLUMN IF NOT EXISTS checkpoint_id TEXT;
+ALTER TABLE op_log ADD COLUMN IF NOT EXISTS checkpoint_name TEXT;
+ALTER TABLE op_log ADD COLUMN IF NOT EXISTS epoch INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS checkpoints (
+  id TEXT NOT NULL,
+  canvas_id TEXT NOT NULL REFERENCES canvases(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  creator_name TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0,
+  state JSONB NOT NULL,
+  at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (canvas_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_canvas_at ON checkpoints (canvas_id, at);
 `;
 
 export class PgStore implements Store {
@@ -86,11 +103,12 @@ export class PgStore implements Store {
   async loadCanvas(id: string): Promise<PersistedCanvas | null> {
     const canvasRes = await this.pool.query('SELECT id, name FROM canvases WHERE id = $1', [id]);
     if (canvasRes.rowCount === 0) return null;
-    const [shapes, connectors, members, ops] = await Promise.all([
+    const [shapes, connectors, members, ops, checkpoints] = await Promise.all([
       this.pool.query('SELECT * FROM shapes WHERE canvas_id = $1', [id]),
       this.pool.query('SELECT * FROM connectors WHERE canvas_id = $1', [id]),
       this.pool.query('SELECT user_id, name, role, color FROM members WHERE canvas_id = $1', [id]),
       this.pool.query('SELECT * FROM op_log WHERE canvas_id = $1 ORDER BY seq ASC', [id]),
+      this.pool.query('SELECT * FROM checkpoints WHERE canvas_id = $1 ORDER BY at ASC, seq ASC', [id]),
     ]);
     return {
       id,
@@ -115,8 +133,24 @@ export class PgStore implements Store {
           undone: r.undone,
           undoneBy: r.undone_by ?? undefined,
           redoable: r.redoable,
+          epoch: r.epoch ?? 0,
           at: new Date(r.at).getTime(),
           label: r.label,
+          checkpointId: r.checkpoint_id ?? undefined,
+          checkpointName: r.checkpoint_name ?? undefined,
+        }),
+      ),
+      checkpoints: checkpoints.rows.map(
+        (r): Checkpoint => ({
+          id: r.id,
+          canvasId: id,
+          name: r.name,
+          createdBy: r.created_by,
+          creatorName: r.creator_name,
+          at: new Date(r.at).getTime(),
+          seq: r.seq,
+          epoch: r.epoch ?? 0,
+          state: r.state,
         }),
       ),
     };
@@ -164,23 +198,101 @@ export class PgStore implements Store {
   }
 
   async appendOp(canvasId: string, e: LogEntry): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO op_log (canvas_id, seq, user_id, kind, forward, inverse, target_seq, undone, undone_by, redoable, label, at, checkpoint_id, checkpoint_name, epoch)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12 / 1000.0), $13, $14, $15)`,
+        [
+          canvasId,
+          e.seq,
+          e.userId,
+          e.kind,
+          JSON.stringify(e.forward),
+          JSON.stringify(e.inverse),
+          e.targetSeq ?? null,
+          e.undone,
+          e.undoneBy ?? null,
+          e.redoable,
+          e.label,
+          e.at,
+          e.checkpointId ?? null,
+          e.checkpointName ?? null,
+          e.epoch,
+        ],
+      );
+      // 整画布恢复：日志与实体内容在同一事务内切换，避免崩溃后日志/实体错位
+      const fx = e.forward;
+      for (const id of fx.deleteShapeIds ?? [])
+        await client.query('DELETE FROM shapes WHERE canvas_id = $1 AND id = $2', [canvasId, id]);
+      for (const s of fx.upsertShapes ?? []) {
+        await client.query(
+          `INSERT INTO shapes (id, canvas_id, kind, x, y, w, h, z, color, text, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+           ON CONFLICT (canvas_id, id)
+           DO UPDATE SET kind = EXCLUDED.kind, x = EXCLUDED.x, y = EXCLUDED.y, w = EXCLUDED.w, h = EXCLUDED.h,
+                         z = EXCLUDED.z, color = EXCLUDED.color, text = EXCLUDED.text, updated_at = now()`,
+          [canvasId, s.id, s.kind, s.x, s.y, s.w, s.h, s.z, s.color, s.text],
+        );
+      }
+      for (const id of fx.deleteConnectorIds ?? [])
+        await client.query('DELETE FROM connectors WHERE canvas_id = $1 AND id = $2', [canvasId, id]);
+      for (const c of fx.upsertConnectors ?? []) {
+        await client.query(
+          `INSERT INTO connectors (id, canvas_id, from_id, to_id, from_side, to_side, path, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+           ON CONFLICT (canvas_id, id)
+           DO UPDATE SET from_id = EXCLUDED.from_id, to_id = EXCLUDED.to_id,
+                         from_side = EXCLUDED.from_side, to_side = EXCLUDED.to_side,
+                         path = EXCLUDED.path, updated_at = now()`,
+          [canvasId, c.id, c.from, c.to, c.fromSide, c.toSide, JSON.stringify(c.path)],
+        );
+      }
+      for (const m of fx.upsertMembers ?? []) {
+        await client.query(
+          `INSERT INTO members (canvas_id, user_id, name, role, color, updated_at)
+           VALUES ($1, $2, $3, $4, $5, now())
+           ON CONFLICT (canvas_id, user_id)
+           DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, color = EXCLUDED.color, updated_at = now()`,
+          [canvasId, m.userId, m.name, m.role, m.color],
+        );
+      }
+      for (const userId of fx.deleteMemberIds ?? []) {
+        await client.query('DELETE FROM members WHERE canvas_id = $1 AND user_id = $2', [canvasId, userId]);
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async saveCheckpoint(canvasId: string, cp: Checkpoint): Promise<void> {
     await this.pool.query(
-      `INSERT INTO op_log (canvas_id, seq, user_id, kind, forward, inverse, target_seq, undone, undone_by, redoable, label, at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12 / 1000.0))`,
-      [
+      `INSERT INTO checkpoints (id, canvas_id, name, created_by, creator_name, seq, epoch, state, at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9 / 1000.0))
+       ON CONFLICT (canvas_id, id) DO NOTHING`,
+      [cp.id, canvasId, cp.name, cp.createdBy, cp.creatorName, cp.seq, cp.epoch, JSON.stringify(cp.state), cp.at],
+    );
+  }
+
+  async listCheckpoints(canvasId: string): Promise<Checkpoint[]> {
+    const res = await this.pool.query('SELECT * FROM checkpoints WHERE canvas_id = $1 ORDER BY at ASC, seq ASC', [canvasId]);
+    return res.rows.map(
+      (r): Checkpoint => ({
+        id: r.id,
         canvasId,
-        e.seq,
-        e.userId,
-        e.kind,
-        JSON.stringify(e.forward),
-        JSON.stringify(e.inverse),
-        e.targetSeq ?? null,
-        e.undone,
-        e.undoneBy ?? null,
-        e.redoable,
-        e.label,
-        e.at,
-      ],
+        name: r.name,
+        createdBy: r.created_by,
+        creatorName: r.creator_name,
+        at: new Date(r.at).getTime(),
+        seq: r.seq,
+        epoch: r.epoch,
+        state: r.state,
+      }),
     );
   }
 

@@ -48,6 +48,9 @@ export class CollabClient {
         this.events.onConnectionChange(true);
       } else if (msg.type === 'op') {
         this.lastSeq = Math.max(this.lastSeq, msg.seq);
+      } else if (msg.type === 'restore') {
+        // 恢复同样占用一个序列位置，断线续传的 lastSeq 必须跟上
+        this.lastSeq = Math.max(this.lastSeq, msg.seq);
       }
       this.events.onMessage(msg);
     };
