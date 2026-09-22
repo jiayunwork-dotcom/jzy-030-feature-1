@@ -6,6 +6,9 @@
  *   拒绝时回包携带权威状态，客户端据此回滚到服务端状态。
  * - 角色降级立即生效：广播 role.changed，并清除被降级者的预览、
  *   用权威图元状态覆盖，其后续写操作一律被拒绝。
+ * - 存档点：打点/恢复都经引擎同一串行队列定序。恢复作为一条 restore
+ *   日志占新 seq，随后向所有在线客户端一次性广播 restored（携带恢复后的
+ *   完整权威快照），并作废房间内所有进行中的拖动预览。
  */
 
 import type { WebSocket } from 'ws';
@@ -111,6 +114,10 @@ export class CollabServer {
         return this.handlePresence(conn, msg);
       case 'role.set':
         return this.handleRoleSet(conn, msg.userId, msg.role);
+      case 'checkpoint.create':
+        return this.handleCheckpointCreate(conn, msg.clientOpId, msg.name);
+      case 'checkpoint.restore':
+        return this.handleCheckpointRestore(conn, msg.clientOpId, msg.checkpointId);
       default:
         this.send(conn.ws, { type: 'error', reason: `未知消息类型: ${(msg as { type: string }).type}` });
     }
@@ -133,6 +140,7 @@ export class CollabServer {
       snapshot: buildSnapshot(engine),
       deltas: lastSeq >= 0 ? deltasSince(engine, lastSeq) : [],
       presence: [...this.room(canvasId).presence.values()].filter((p) => p.userId !== msg.userId),
+      checkpoints: engine.listCheckpoints(),
     });
     if (isNew) this.broadcast(canvasId, { type: 'member.joined', member }, conn);
   }
@@ -277,6 +285,47 @@ export class CollabServer {
     } catch (err) {
       const reason = err instanceof OpError ? err.message : '角色调整被拒绝';
       this.send(conn.ws, { type: 'error', reason });
+    }
+  }
+
+  /* ---------------- 存档点：打点与恢复（房主专属，走同一串行定序通道） ---------------- */
+
+  private async handleCheckpointCreate(conn: Conn, clientOpId: string, name: string) {
+    if (!conn.userId) return this.send(conn.ws, { type: 'checkpoint.reject', clientOpId, reason: '尚未加入画布' });
+    const engine = await this.getEngine(conn.canvasId);
+    try {
+      // 打点也进串行队列：保证记录的是某个确定 seq 时刻的一致状态
+      const checkpoint = await engine.enqueue(() => engine.createCheckpoint(conn.userId, name));
+      this.send(conn.ws, { type: 'checkpoint.ack', clientOpId, checkpoint });
+      this.broadcast(conn.canvasId, { type: 'checkpoint.created', checkpoint }, conn);
+    } catch (err) {
+      const reason = err instanceof OpError ? err.message : '打存档点被拒绝';
+      this.send(conn.ws, { type: 'checkpoint.reject', clientOpId, reason });
+    }
+  }
+
+  private async handleCheckpointRestore(conn: Conn, clientOpId: string, checkpointId: string) {
+    if (!conn.userId) return this.send(conn.ws, { type: 'checkpoint.reject', clientOpId, reason: '尚未加入画布' });
+    const engine = await this.getEngine(conn.canvasId);
+    try {
+      // 恢复与普通编辑共用同一串行队列：恢复进行时不会有其它写插进来，
+      // 恢复本身作为 restore 日志占一个新的 seq。
+      const { entry, checkpoint } = await engine.enqueue(() =>
+        engine.restoreCheckpoint(conn.userId, checkpointId),
+      );
+      // 作废所有人进行中的拖动预览：半截脏位置不能盖在刚恢复出来的画面上。
+      // 客户端收到 restored 后整体对齐快照并回弹本地未提交交互。
+      this.room(conn.canvasId).previews.clear();
+      this.broadcast(conn.canvasId, {
+        type: 'restored',
+        seq: entry.seq,
+        checkpoint,
+        by: conn.userId,
+        snapshot: buildSnapshot(engine),
+      });
+    } catch (err) {
+      const reason = err instanceof OpError ? err.message : '恢复被拒绝';
+      this.send(conn.ws, { type: 'checkpoint.reject', clientOpId, reason });
     }
   }
 

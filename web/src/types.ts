@@ -63,6 +63,20 @@ export interface Effects {
   deleteShapeIds?: string[];
   upsertConnectors?: Connector[];
   deleteConnectorIds?: string[];
+  upsertMembers?: Member[];
+  deleteMemberIds?: string[];
+}
+
+/** 存档点元信息：内容不可变，id 稳定 */
+export interface CheckpointMeta {
+  id: string;
+  canvasId: string;
+  name: string;
+  createdBy: string;
+  createdByName: string;
+  createdAt: number;
+  /** 打点时操作序列的位置 */
+  seq: number;
 }
 
 export interface Snapshot {
@@ -87,10 +101,12 @@ export type ClientMessage =
   | { type: 'preview'; shapes: Shape[] }
   | { type: 'preview.end' }
   | { type: 'presence'; cursor: { x: number; y: number } | null; selection: string[] }
-  | { type: 'role.set'; userId: string; role: Role };
+  | { type: 'role.set'; userId: string; role: Role }
+  | { type: 'checkpoint.create'; clientOpId: string; name: string }
+  | { type: 'checkpoint.restore'; clientOpId: string; checkpointId: string };
 
 export type ServerMessage =
-  | { type: 'welcome'; canvasId: string; you: Member; seq: number; snapshot: Snapshot; deltas: { seq: number; userId: string; kind: string; forward: Effects }[]; presence: PresenceState[] }
+  | { type: 'welcome'; canvasId: string; you: Member; seq: number; snapshot: Snapshot; deltas: { seq: number; userId: string; kind: string; forward: Effects }[]; presence: PresenceState[]; checkpoints: CheckpointMeta[] }
   | { type: 'op'; seq: number; userId: string; kind: string; forward: Effects; label: string }
   | { type: 'op.ack'; clientOpId: string; seq: number }
   | { type: 'op.reject'; clientOpId: string; reason: string; shapes?: Shape[]; connectors?: Connector[] }
@@ -100,4 +116,8 @@ export type ServerMessage =
   | { type: 'presence.clear'; userId: string }
   | { type: 'role.changed'; member: Member }
   | { type: 'member.joined'; member: Member }
+  | { type: 'checkpoint.created'; checkpoint: CheckpointMeta }
+  | { type: 'checkpoint.ack'; clientOpId: string; checkpoint: CheckpointMeta }
+  | { type: 'checkpoint.reject'; clientOpId: string; reason: string }
+  | { type: 'restored'; seq: number; checkpoint: CheckpointMeta; by: string; snapshot: Snapshot }
   | { type: 'error'; reason: string };

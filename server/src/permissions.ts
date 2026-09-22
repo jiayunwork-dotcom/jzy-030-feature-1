@@ -25,6 +25,11 @@ export function canManageRoles(role: Role): boolean {
   return role === 'owner';
 }
 
+/** 打存档点与发起恢复都是房主专属能力（恢复本身按一次"写"对待） */
+export function canManageHistory(role: Role): boolean {
+  return role === 'owner';
+}
+
 /** 写操作（含 undo/redo）统一入口校验 */
 export function assertCanEdit(member: Member | undefined, userId: string): asserts member is Member {
   if (!member) {
@@ -41,6 +46,16 @@ export function assertCanManageRoles(member: Member | undefined, userId: string)
   }
   if (!canManageRoles(member.role)) {
     throw new OpError(`成员「${member.name}」不是房主，无权调整他人角色`);
+  }
+}
+
+/** 打点/恢复的统一入口校验：任何路径（含只读成员）都过不了这一关 */
+export function assertCanManageHistory(member: Member | undefined, userId: string): asserts member is Member {
+  if (!member) {
+    throw new OpError(`用户 ${userId} 不是画布成员，无权管理存档点`);
+  }
+  if (!canManageHistory(member.role)) {
+    throw new OpError(`成员「${member.name}」不是房主，无权打存档点或发起恢复（仅房主可用）`);
   }
 }
 

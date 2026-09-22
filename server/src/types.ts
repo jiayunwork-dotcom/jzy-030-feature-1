@@ -93,13 +93,36 @@ export interface Effects {
   deleteShapeIds?: string[];
   upsertConnectors?: Connector[];
   deleteConnectorIds?: string[];
+  /** 仅"恢复到存档点"这类跨成员的整体状态跳变使用：成员集合整体对齐 */
+  upsertMembers?: Member[];
+  deleteMemberIds?: string[];
+}
+
+/**
+ * 存档点元信息：内容不可变，id 稳定（重连/重启后仍指向同一份历史）。
+ * state（打点那一刻的完整画布）持久化在 checkpoints 表，见 history.ts。
+ */
+export interface CheckpointMeta {
+  id: string;
+  canvasId: string;
+  name: string;
+  createdBy: string;
+  createdByName: string;
+  createdAt: number;
+  /** 打点时操作序列的位置：该存档点记录的是此 seq 时刻的权威状态 */
+  seq: number;
 }
 
 /** 操作日志条目：forward/inverse 成对存储，撤销即应用 inverse */
 export interface LogEntry {
   seq: number;
   userId: string;
-  kind: 'normal' | 'undo' | 'redo';
+  /**
+   * normal：普通编辑；undo/redo：按人撤销重做；
+   * restore：恢复到存档点（跨所有人的整体状态跳变，占一个新 seq，
+   * 并成为撤销/重做的屏障——屏障之前的条目不可再被撤销/重做）。
+   */
+  kind: 'normal' | 'undo' | 'redo' | 'restore';
   /** 正向效果（已含连线重算等派生变更） */
   forward: Effects;
   /** 逆向效果（撤销时应用） */
@@ -141,7 +164,9 @@ export type ClientMessage =
   | { type: 'preview'; shapes: Shape[] }
   | { type: 'preview.end' }
   | { type: 'presence'; cursor: { x: number; y: number } | null; selection: string[] }
-  | { type: 'role.set'; userId: string; role: Role };
+  | { type: 'role.set'; userId: string; role: Role }
+  | { type: 'checkpoint.create'; clientOpId: string; name: string }
+  | { type: 'checkpoint.restore'; clientOpId: string; checkpointId: string };
 
 /* ---------------- 服务端 -> 客户端 ---------------- */
 
@@ -155,6 +180,8 @@ export type ServerMessage =
       /** lastSeq 之后的增量（断线续传），按 seq 升序 */
       deltas: { seq: number; userId: string; kind: LogEntry['kind']; forward: Effects }[];
       presence: PresenceState[];
+      /** 当前画布的全部存档点（所有在线成员可见） */
+      checkpoints: CheckpointMeta[];
     }
   | { type: 'op'; seq: number; userId: string; kind: LogEntry['kind']; forward: Effects; label: string }
   | { type: 'op.ack'; clientOpId: string; seq: number }
@@ -172,6 +199,18 @@ export type ServerMessage =
   | { type: 'presence.clear'; userId: string }
   | { type: 'role.changed'; member: Member }
   | { type: 'member.joined'; member: Member }
+  /** 存档点创建成功：广播给打点者之外的在线成员 */
+  | { type: 'checkpoint.created'; checkpoint: CheckpointMeta }
+  /** 打点者收到的确认（与 checkpoint.created 内容一致，带 clientOpId 便于关联） */
+  | { type: 'checkpoint.ack'; clientOpId: string; checkpoint: CheckpointMeta }
+  /** 打点/恢复被拒绝（非房主、存档点不存在等），reason 为人类可读原因 */
+  | { type: 'checkpoint.reject'; clientOpId: string; reason: string }
+  /**
+   * 恢复完成：一次性广播给所有在线客户端（含发起者）。
+   * 携带恢复后的完整权威快照与新占的序列位置 seq，
+   * 客户端整体对齐到快照，不进行中的交互一律作废回弹。
+   */
+  | { type: 'restored'; seq: number; checkpoint: CheckpointMeta; by: string; snapshot: Snapshot }
   | { type: 'error'; reason: string };
 
 /** 画布坐标/尺寸合法范围（越界写将被拒绝） */

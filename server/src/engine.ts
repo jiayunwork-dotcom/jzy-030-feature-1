@@ -8,14 +8,23 @@
  *   撤销 = 应用本人最近一条 normal 日志的 inverse（只回退该步涉及的属性，
  *   他人对同一图元其它属性的改动不受影响）；重做同理。
  * - 图元几何变化后，受影响连线经路由模块重算，路径随操作一并广播。
+ * - 存档点：房主可把当前权威状态凝固为不可变的命名存档点（含图元/连线/
+ *   成员角色与其对应的 seq 位置）；恢复 = 把整张画布整体切回某存档点，
+ *   作为 kind='restore' 的日志条目走同一条串行定序通道、占一个新 seq。
+ *   恢复是撤销/重做的屏障：屏障之前的条目不可再被撤销/重做，
+ *   因此"某人一撤销就把画面拽回恢复前"不可能发生；历史只增不删，
+ *   倒回后可以继续编辑、打新点、再倒回到任意存档点。
  */
 
-import { OpError, assertCanEdit, assertCanManageRoles, isValidRole } from './permissions.js';
+import { randomUUID } from 'node:crypto';
+import { snapshotOf, type CheckpointState } from './history.js';
+import { OpError, assertCanEdit, assertCanManageHistory, assertCanManageRoles, isValidRole } from './permissions.js';
 import { routeConnector } from './router.js';
-import type { Store } from './persistence/store.js';
+import type { Store, StoredCheckpoint } from './persistence/store.js';
 import {
   BOUNDS,
   type CanvasState,
+  type CheckpointMeta,
   type Connector,
   type Effects,
   type LogEntry,
@@ -40,6 +49,8 @@ const PATCHABLE_KEYS = new Set(['x', 'y', 'w', 'h', 'z', 'color', 'text']);
 export class Engine {
   readonly state: CanvasState;
   readonly log: LogEntry[] = [];
+  /** 全部存档点（id -> 不可变历史内容），随引擎加载重建，重启后仍在 */
+  readonly checkpoints = new Map<string, StoredCheckpoint>();
   private store: Store;
   /** 串行化队列：保证 定序 = 接收顺序 = 持久化顺序 */
   private queue: Promise<unknown> = Promise.resolve();
@@ -67,6 +78,8 @@ export class Engine {
       for (const e of persisted.ops) engine.log.push(e);
       state.seq = persisted.ops.reduce((max, e) => Math.max(max, e.seq), 0);
     }
+    // 存档点从持久层重建：id 稳定，内容不可变
+    for (const cp of await store.loadCheckpoints(canvasId)) engine.checkpoints.set(cp.meta.id, cp);
     return engine;
   }
 
@@ -126,12 +139,25 @@ export class Engine {
     return this.commit(userId, 'normal', forward, this.describe(op));
   }
 
+  /**
+   * 撤销/重做的恢复屏障：最近一次 restore 的 seq（无则 0）。
+   * 恢复是跨所有人的整体状态跳变，屏障之前的 normal 条目不可再被
+   * 撤销/重做——否则"某人一撤销就把画面拽回恢复前"，与恢复语义自相矛盾。
+   */
+  private restoreBarrier(): number {
+    for (let i = this.log.length - 1; i >= 0; i--) {
+      if (this.log[i].kind === 'restore') return this.log[i].seq;
+    }
+    return 0;
+  }
+
   async undo(userId: string): Promise<LogEntry> {
     const member = this.state.members.get(userId);
     assertCanEdit(member, userId);
+    const barrier = this.restoreBarrier();
     const target = [...this.log]
       .reverse()
-      .find((e) => e.userId === userId && e.kind === 'normal' && !e.undone);
+      .find((e) => e.userId === userId && e.kind === 'normal' && !e.undone && e.seq > barrier);
     if (!target) throw new OpError('没有可撤销的操作');
     const entry = await this.commit(userId, 'undo', target.inverse, `撤销：${target.label}`, target.seq);
     await this.markFlags(target.seq, { undone: true, undoneBy: entry.seq });
@@ -141,13 +167,98 @@ export class Engine {
   async redo(userId: string): Promise<LogEntry> {
     const member = this.state.members.get(userId);
     assertCanEdit(member, userId);
+    const barrier = this.restoreBarrier();
     const target = [...this.log]
-      .filter((e) => e.userId === userId && e.kind === 'normal' && e.undone && e.redoable)
+      .filter((e) => e.userId === userId && e.kind === 'normal' && e.undone && e.redoable && e.seq > barrier)
       .sort((a, b) => (b.undoneBy ?? 0) - (a.undoneBy ?? 0))[0];
     if (!target) throw new OpError('没有可重做的操作');
     const entry = await this.commit(userId, 'redo', target.forward, `重做：${target.label}`, target.seq);
     await this.markFlags(target.seq, { undone: false, undoneBy: null });
     return entry;
+  }
+
+  /* ---------------- 存档点：打点 / 恢复 / 重建 ---------------- */
+
+  /** 全部存档点元信息（按创建时刻稳定排序），供列表展示 */
+  listCheckpoints(): CheckpointMeta[] {
+    return [...this.checkpoints.values()]
+      .map((c) => c.meta)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+  }
+
+  /**
+   * 房主在协作进行中给当前画布打点：把这一刻的完整权威状态
+   * （图元/连线/成员角色 + 当前 seq 位置）凝固为不可变存档点。
+   * 名字允许重复，id 由服务端生成、稳定唯一。
+   */
+  async createCheckpoint(userId: string, name: string): Promise<CheckpointMeta> {
+    const member = this.state.members.get(userId);
+    assertCanManageHistory(member, userId);
+    if (typeof name !== 'string') throw new OpError('存档点名字非法');
+    const trimmed = name.trim();
+    if (!trimmed) throw new OpError('存档点名字不能为空');
+    if (trimmed.length > 80) throw new OpError('存档点名字过长（最多 80 字）');
+    const meta: CheckpointMeta = {
+      id: `cp-${randomUUID()}`,
+      canvasId: this.state.id,
+      name: trimmed,
+      createdBy: userId,
+      createdByName: member.name,
+      createdAt: Date.now(),
+      seq: this.state.seq,
+    };
+    const stored: StoredCheckpoint = { meta, state: snapshotOf(this.state) };
+    await this.store.saveCheckpoint(this.state.id, stored);
+    this.checkpoints.set(meta.id, stored);
+    return meta;
+  }
+
+  /**
+   * 确定性重建某个存档点当时的完整画布状态。
+   * 同一 id 无论何时、在哪个实例上重建，结果逐字节一致（规范化快照）。
+   */
+  rebuildCheckpoint(checkpointId: string): CheckpointState {
+    const cp = this.checkpoints.get(checkpointId);
+    if (!cp) throw new OpError(`存档点 ${checkpointId} 不存在`);
+    return snapshotOf({
+      id: this.state.id,
+      seq: cp.meta.seq,
+      shapes: new Map(cp.state.shapes.map((s) => [s.id, s])),
+      connectors: new Map(cp.state.connectors.map((c) => [c.id, c])),
+      members: new Map(cp.state.members.map((m) => [m.userId, m])),
+    });
+  }
+
+  /**
+   * 房主发起恢复：把整张画布的权威状态整体切换为存档点记录的样子。
+   * 走与普通编辑同一条串行定序通道（enqueue 调用方保证），作为
+   * kind='restore' 的日志条目占一个新 seq；恢复是写操作，房主专属。
+   * 历史只增不删：恢复不打断时间线，之后可继续编辑、打点、再恢复。
+   */
+  async restoreCheckpoint(
+    userId: string,
+    checkpointId: string,
+  ): Promise<{ entry: LogEntry; checkpoint: CheckpointMeta }> {
+    const member = this.state.members.get(userId);
+    assertCanManageHistory(member, userId);
+    const cp = this.checkpoints.get(checkpointId);
+    if (!cp) throw new OpError(`存档点 ${checkpointId} 不存在`);
+    const target = cp.state;
+    const targetShapeIds = new Set(target.shapes.map((s) => s.id));
+    const targetConnectorIds = new Set(target.connectors.map((c) => c.id));
+    const targetMemberIds = new Set(target.members.map((m) => m.userId));
+    // 整体对齐到存档点状态：目标全量 upsert，当前多出来的整体删除。
+    // 连线端点必然落在目标图元集合内（存档点自身一致），恢复后不留悬空端点。
+    const forward: Effects = {
+      upsertShapes: target.shapes.map((s) => structuredClone(s)),
+      deleteShapeIds: [...this.state.shapes.keys()].filter((id) => !targetShapeIds.has(id)),
+      upsertConnectors: target.connectors.map((c) => structuredClone(c)),
+      deleteConnectorIds: [...this.state.connectors.keys()].filter((id) => !targetConnectorIds.has(id)),
+      upsertMembers: target.members.map((m) => structuredClone(m)),
+      deleteMemberIds: [...this.state.members.keys()].filter((id) => !targetMemberIds.has(id)),
+    };
+    const entry = await this.commit(userId, 'restore', forward, `恢复到存档点「${cp.meta.name}」`);
+    return { entry, checkpoint: cp.meta };
   }
 
   /* ---------------- 校验：拒绝越权/越界/悬空引用 ---------------- */
@@ -337,6 +448,22 @@ export class Engine {
       (forward.deleteConnectorIds ??= []).push(id);
     }
 
+    // upsertMembers / deleteMemberIds：仅 restore 提交使用，成员集合整体对齐。
+    for (const m of template.upsertMembers ?? []) {
+      const prev = this.state.members.get(m.userId);
+      if (prev) (inverse.upsertMembers ??= []).push(structuredClone(prev));
+      else (inverse.deleteMemberIds ??= []).push(m.userId);
+      this.state.members.set(m.userId, structuredClone(m));
+      (forward.upsertMembers ??= []).push(structuredClone(m));
+    }
+    for (const id of template.deleteMemberIds ?? []) {
+      const prev = this.state.members.get(id);
+      if (!prev) continue;
+      (inverse.upsertMembers ??= []).push(structuredClone(prev));
+      this.state.members.delete(id);
+      (forward.deleteMemberIds ??= []).push(id);
+    }
+
     // 几何变化 -> 受影响连线重算（端点重新贴合最近锚点，路径重算）
     if (geometryTouched.size > 0) {
       for (const conn of this.state.connectors.values()) {
@@ -398,6 +525,8 @@ export class Engine {
     for (const id of forward.deleteShapeIds ?? []) await this.store.deleteShape(canvasId, id);
     for (const c of forward.upsertConnectors ?? []) await this.store.upsertConnector(canvasId, c);
     for (const id of forward.deleteConnectorIds ?? []) await this.store.deleteConnector(canvasId, id);
+    for (const m of forward.upsertMembers ?? []) await this.store.upsertMember(canvasId, m);
+    for (const id of forward.deleteMemberIds ?? []) await this.store.deleteMember(canvasId, id);
   }
 
   private async markFlags(seq: number, flags: { undone?: boolean; undoneBy?: number | null; redoable?: boolean }) {

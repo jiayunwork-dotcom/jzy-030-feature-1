@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { CanvasView } from './components/CanvasView';
 import { MembersPanel } from './components/MembersPanel';
+import { TimelinePanel } from './components/TimelinePanel';
 import { Toolbar } from './components/Toolbar';
 import { store, useStore } from './state/hooks';
 
@@ -32,6 +33,7 @@ export default function App() {
       <Toolbar />
       <div className="main">
         <CanvasView />
+        <TimelinePanel />
         <MembersPanel />
       </div>
       {store.self?.role === 'viewer' && (

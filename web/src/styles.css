@@ -160,6 +160,110 @@ body,
   overflow-y: auto;
 }
 
+/* ---------------- 时间线 / 存档点面板 ---------------- */
+
+.timeline {
+  width: 280px;
+  background: #fff;
+  border-left: 1px solid #e2e8f0;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.timeline-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: #475569;
+  margin-bottom: 10px;
+}
+
+.checkpoint-create {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.checkpoint-create input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+
+.checkpoint-create input:disabled {
+  background: #f1f5f9;
+  color: #94a3b8;
+}
+
+.checkpoint-create button,
+.checkpoint-restore {
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.checkpoint-create button:not(:disabled):hover,
+.checkpoint-restore:not(:disabled):hover {
+  border-color: #2563eb;
+  color: #2563eb;
+}
+
+.checkpoint-create button:disabled,
+.checkpoint-restore:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.checkpoint-empty {
+  font-size: 12px;
+  color: #94a3b8;
+  line-height: 1.6;
+  padding: 8px 2px;
+}
+
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid #f1f5f9;
+}
+
+.checkpoint-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2563eb;
+  flex: none;
+  box-shadow: 0 0 0 3px #dbeafe;
+}
+
+.checkpoint-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.checkpoint-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkpoint-meta {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 2px;
+}
+
 .members-title {
   font-weight: 600;
   font-size: 13px;

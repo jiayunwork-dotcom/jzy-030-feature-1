@@ -1,12 +1,17 @@
 /**
  * PostgreSQL 16 持久化实现。
- * 表结构：canvases / members / shapes / connectors / op_log。
- * 服务器重启后从 op_log 重建定序与撤销栈，从 shapes/connectors 恢复画布内容。
+ * 表结构：canvases / members / shapes / connectors / op_log / checkpoints。
+ * 服务器重启后从 op_log 重建定序与撤销栈，从 shapes/connectors 恢复画布内容，
+ * 从 checkpoints 恢复全部存档点及其指向的历史画布状态。
+ * 建表一律 CREATE TABLE IF NOT EXISTS：不含历史结构的旧库启动时自动补齐，
+ * 旧画布没有存档点记录即视为空时间线，平滑升级。
  */
 
 import pg from 'pg';
+import type { CheckpointState } from '../history.js';
+import { canonicalCheckpointState } from '../history.js';
 import type { Connector, LogEntry, Member, Shape } from '../types.js';
-import type { PersistedCanvas, Store } from './store.js';
+import type { PersistedCanvas, Store, StoredCheckpoint } from './store.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS canvases (
@@ -62,6 +67,17 @@ CREATE TABLE IF NOT EXISTS op_log (
   label TEXT NOT NULL DEFAULT '',
   at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (canvas_id, seq)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+  canvas_id TEXT NOT NULL REFERENCES canvases(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_by_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  seq INTEGER NOT NULL,
+  state JSONB NOT NULL,
+  PRIMARY KEY (canvas_id, id)
 );
 `;
 
@@ -130,6 +146,10 @@ export class PgStore implements Store {
        DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role, color = EXCLUDED.color, updated_at = now()`,
       [canvasId, m.userId, m.name, m.role, m.color],
     );
+  }
+
+  async deleteMember(canvasId: string, userId: string): Promise<void> {
+    await this.pool.query('DELETE FROM members WHERE canvas_id = $1 AND user_id = $2', [canvasId, userId]);
   }
 
   async upsertShape(canvasId: string, s: Shape): Promise<void> {
@@ -205,6 +225,46 @@ export class PgStore implements Store {
     }
     if (sets.length === 0) return;
     await this.pool.query(`UPDATE op_log SET ${sets.join(', ')} WHERE canvas_id = $1 AND seq = $2`, vals);
+  }
+
+  async saveCheckpoint(canvasId: string, cp: StoredCheckpoint): Promise<void> {
+    // 存档点不可变：同 id 冲突直接报错（主键约束兜底），绝不覆盖已落定历史
+    await this.pool.query(
+      `INSERT INTO checkpoints (canvas_id, id, name, created_by, created_by_name, created_at, seq, state)
+       VALUES ($1, $2, $3, $4, $5, to_timestamp($6 / 1000.0), $7, $8)`,
+      [
+        canvasId,
+        cp.meta.id,
+        cp.meta.name,
+        cp.meta.createdBy,
+        cp.meta.createdByName,
+        cp.meta.createdAt,
+        cp.meta.seq,
+        JSON.stringify(canonicalCheckpointState(cp.state)),
+      ],
+    );
+  }
+
+  async loadCheckpoints(canvasId: string): Promise<StoredCheckpoint[]> {
+    const res = await this.pool.query(
+      'SELECT * FROM checkpoints WHERE canvas_id = $1 ORDER BY created_at ASC, id ASC',
+      [canvasId],
+    );
+    return res.rows.map((r): StoredCheckpoint => {
+      const state = canonicalCheckpointState(r.state as CheckpointState);
+      return {
+        meta: {
+          id: r.id,
+          canvasId,
+          name: r.name,
+          createdBy: r.created_by,
+          createdByName: r.created_by_name,
+          createdAt: new Date(r.created_at).getTime(),
+          seq: r.seq,
+        },
+        state,
+      };
+    });
   }
 
   async close(): Promise<void> {

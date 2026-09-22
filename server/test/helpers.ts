@@ -8,9 +8,11 @@ import WebSocket from 'ws';
 import { createServer } from '../src/index.js';
 import { MemoryStore, type Store } from '../src/persistence/store.js';
 import type {
+  CheckpointMeta,
   ClientMessage,
   Connector,
   Effects,
+  Member,
   Op,
   ServerMessage,
   Shape,
@@ -45,7 +47,11 @@ export class TestClient {
   messages: ServerMessage[] = [];
   shapes = new Map<string, Shape>();
   connectors = new Map<string, Connector>();
+  members = new Map<string, Member>();
+  checkpoints: CheckpointMeta[] = [];
   lastSeq = 0;
+  /** 已收到的 restored 广播数（用于区分连续多次恢复） */
+  private restoredCount = 0;
   private waiters: { pred: (m: ServerMessage) => boolean; resolve: (m: ServerMessage) => void }[] = [];
 
   constructor(userId: string) {
@@ -73,6 +79,7 @@ export class TestClient {
     });
     client.welcome = (await welcomePromise) as Extract<ServerMessage, { type: 'welcome' }>;
     client.applySnapshot(client.welcome.snapshot);
+    client.checkpoints = [...client.welcome.checkpoints];
     return client;
   }
 
@@ -81,6 +88,17 @@ export class TestClient {
     if (msg.type === 'op') {
       this.applyEffects(msg.forward);
       this.lastSeq = Math.max(this.lastSeq, msg.seq);
+    } else if (msg.type === 'restored') {
+      // 恢复 = 整体状态跳变：直接以权威快照对齐，不本地拼接
+      this.restoredCount++;
+      this.applySnapshot(msg.snapshot);
+      this.lastSeq = Math.max(this.lastSeq, msg.seq);
+    } else if (msg.type === 'checkpoint.created' || msg.type === 'checkpoint.ack') {
+      if (!this.checkpoints.some((c) => c.id === msg.checkpoint.id)) this.checkpoints.push(msg.checkpoint);
+    } else if (msg.type === 'role.changed') {
+      this.members.set(msg.member.userId, msg.member);
+    } else if (msg.type === 'member.joined') {
+      this.members.set(msg.member.userId, msg.member);
     }
     for (let i = this.waiters.length - 1; i >= 0; i--) {
       if (this.waiters[i].pred(msg)) {
@@ -94,8 +112,11 @@ export class TestClient {
   private applySnapshot(snap: Snapshot) {
     this.shapes.clear();
     this.connectors.clear();
-    for (const s of snap.shapes) this.shapes.set(s.id, s);
-    for (const c of snap.connectors) this.connectors.set(c.id, c);
+    this.members.clear();
+    // 深拷贝：本地状态与消息体解耦，后续增量不会回写已接收的快照内容
+    for (const s of snap.shapes) this.shapes.set(s.id, structuredClone(s));
+    for (const c of snap.connectors) this.connectors.set(c.id, structuredClone(c));
+    for (const m of snap.members) this.members.set(m.userId, structuredClone(m));
   }
 
   applyEffects(fx: Effects) {
@@ -107,6 +128,8 @@ export class TestClient {
     for (const id of fx.deleteShapeIds ?? []) this.shapes.delete(id);
     for (const c of fx.upsertConnectors ?? []) this.connectors.set(c.id, structuredClone(c));
     for (const id of fx.deleteConnectorIds ?? []) this.connectors.delete(id);
+    for (const m of fx.upsertMembers ?? []) this.members.set(m.userId, structuredClone(m));
+    for (const id of fx.deleteMemberIds ?? []) this.members.delete(id);
   }
 
   send(msg: ClientMessage) {
@@ -143,6 +166,38 @@ export class TestClient {
     this.send({ type: 'redo', clientOpId });
     const msg = await result;
     return msg.type === 'op.ack' ? { acked: true, seq: msg.seq } : { acked: false, reason: msg.reason };
+  }
+
+  /** 打存档点（房主专属），等待 ack 或 reject */
+  async createCheckpoint(
+    name: string,
+  ): Promise<{ acked: boolean; checkpoint?: CheckpointMeta; reason?: string }> {
+    const clientOpId = `c${++opCounter}`;
+    const result = this.waitFor(
+      (m) =>
+        (m.type === 'checkpoint.ack' && m.clientOpId === clientOpId) ||
+        (m.type === 'checkpoint.reject' && m.clientOpId === clientOpId),
+    );
+    this.send({ type: 'checkpoint.create', clientOpId, name });
+    const msg = await result;
+    if (msg.type === 'checkpoint.ack') return { acked: true, checkpoint: msg.checkpoint };
+    return { acked: false, reason: msg.reason };
+  }
+
+  /** 恢复到指定存档点（房主专属），成功时以 restored 广播为准 */
+  async restore(checkpointId: string): Promise<{ acked: boolean; seq?: number; reason?: string }> {
+    const clientOpId = `c${++opCounter}`;
+    // 只认本次发送之后到达的 restored，避免命中缓冲区里上一次恢复的广播
+    const seen = this.restoredCount;
+    const result = this.waitFor(
+      (m) =>
+        (m.type === 'restored' && this.restoredCount > seen) ||
+        (m.type === 'checkpoint.reject' && m.clientOpId === clientOpId),
+    );
+    this.send({ type: 'checkpoint.restore', clientOpId, checkpointId });
+    const msg = await result;
+    if (msg.type === 'restored') return { acked: true, seq: msg.seq };
+    return { acked: false, reason: msg.reason };
   }
 
   /** 等待客户端应用过 seq >= 指定值的广播（消除"ack 已到、广播未到"的竞态） */

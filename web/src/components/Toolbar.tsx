@@ -48,6 +48,14 @@ export function Toolbar() {
         重做
       </button>
       <span className="sep" />
+      <button
+        className={store.timelineOpen ? 'active' : ''}
+        onClick={() => store.toggleTimeline()}
+        title="查看存档点时间线（打点/恢复仅房主）"
+      >
+        时间线{store.checkpoints.length > 0 ? `（${store.checkpoints.length}）` : ''}
+      </button>
+      <span className="sep" />
       <span className={`badge role-${store.self?.role ?? 'viewer'}`}>{roleLabel}</span>
       <span className={`badge ${store.connected ? 'online' : 'offline'}`}>
         {store.connected ? '已连接' : '重连中…'}

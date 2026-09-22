@@ -9,6 +9,7 @@
 
 import { CollabClient } from './client';
 import type {
+  CheckpointMeta,
   Connector,
   Effects,
   Member,
@@ -69,6 +70,9 @@ export class WhiteboardStore {
   selection: string[] = [];
   connectSource: string | null = null;
   toasts: Toast[] = [];
+  /** 画布时间线：全部存档点（所有在线成员可见，打点/恢复仅房主） */
+  checkpoints: CheckpointMeta[] = [];
+  timelineOpen = false;
   /** 每次状态变化自增，供 useSyncExternalStore 做快照 */
   version = 0;
 
@@ -116,6 +120,10 @@ export class WhiteboardStore {
     return this.self?.role === 'owner' || this.self?.role === 'editor';
   }
 
+  get isOwner(): boolean {
+    return this.self?.role === 'owner';
+  }
+
   /* ---------------- 消息处理 ---------------- */
 
   private handleMessage(msg: ServerMessage) {
@@ -131,6 +139,7 @@ export class WhiteboardStore {
         this.presence.clear();
         for (const p of msg.presence) this.presence.set(p.userId, p);
         this.previews.clear();
+        this.checkpoints = msg.checkpoints;
         this.emit();
         break;
       }
@@ -193,6 +202,45 @@ export class WhiteboardStore {
         this.emit();
         break;
       }
+      case 'checkpoint.created':
+      case 'checkpoint.ack': {
+        if (!this.checkpoints.some((c) => c.id === msg.checkpoint.id)) {
+          this.checkpoints = [...this.checkpoints, msg.checkpoint];
+        }
+        if (msg.type === 'checkpoint.ack') this.toast(`存档点「${msg.checkpoint.name}」已创建`);
+        this.emit();
+        break;
+      }
+      case 'checkpoint.reject': {
+        this.toast(`操作被拒绝：${msg.reason}`);
+        this.emit();
+        break;
+      }
+      case 'restored': {
+        // 恢复是一次跨所有人的整体状态跳变：进行中的拖动/连线一律作废回弹，
+        // 本地不做任何拼接，直接用服务端广播的权威快照整体对齐。
+        this.rollbackDrag();
+        this.connectSource = null;
+        this.shapes.clear();
+        this.connectors.clear();
+        this.members.clear();
+        for (const s of msg.snapshot.shapes) this.shapes.set(s.id, s);
+        for (const c of msg.snapshot.connectors) this.connectors.set(c.id, c);
+        for (const m of msg.snapshot.members) this.members.set(m.userId, m);
+        this.previews.clear();
+        this.selection = this.selection.filter((id) => this.shapes.has(id));
+        const me = msg.snapshot.members.find((m) => m.userId === this.self?.userId);
+        if (me) {
+          this.self = me;
+        } else if (this.self) {
+          // 恢复后的成员名单里没有自己：本地按只读对待，重新加入可恢复
+          this.self = { ...this.self, role: 'viewer' };
+          this.toast('恢复后的成员名单中没有你，当前按只读观看（重连可重新加入）');
+        }
+        this.toast(`画布已恢复到存档点「${msg.checkpoint.name}」`);
+        this.emit();
+        break;
+      }
       case 'error': {
         this.toast(msg.reason);
         break;
@@ -214,6 +262,8 @@ export class WhiteboardStore {
     }
     for (const c of fx.upsertConnectors ?? []) this.connectors.set(c.id, c);
     for (const id of fx.deleteConnectorIds ?? []) this.connectors.delete(id);
+    for (const m of fx.upsertMembers ?? []) this.members.set(m.userId, m);
+    for (const id of fx.deleteMemberIds ?? []) this.members.delete(id);
   }
 
   /* ---------------- 操作发送（乐观应用 + 拒绝回滚） ---------------- */
@@ -244,6 +294,25 @@ export class WhiteboardStore {
 
   setRole(userId: string, role: Role) {
     this.client.send({ type: 'role.set', userId, role });
+  }
+
+  /* ---------------- 存档点时间线（打点/恢复仅房主） ---------------- */
+
+  toggleTimeline() {
+    this.timelineOpen = !this.timelineOpen;
+    this.emit();
+  }
+
+  createCheckpoint(name: string) {
+    if (!this.isOwner) return this.toast('仅房主可以打存档点');
+    const trimmed = name.trim();
+    if (!trimmed) return this.toast('请输入存档点名字');
+    this.client.send({ type: 'checkpoint.create', clientOpId: this.nextOpId(), name: trimmed });
+  }
+
+  restoreCheckpoint(checkpointId: string) {
+    if (!this.isOwner) return this.toast('仅房主可以恢复存档点');
+    this.client.send({ type: 'checkpoint.restore', clientOpId: this.nextOpId(), checkpointId });
   }
 
   rename(name: string) {
